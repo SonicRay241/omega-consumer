@@ -32,6 +32,14 @@ export class SubscriptionManager<T> {
     }
 
     /**
+     * Subscribe to other subscriberId
+     */
+    resubscribe(valueId: string, subscriberId: string, callback: Callback<T>) {
+        this.unsubscribe(subscriberId)
+        this.subscribe(valueId, subscriberId, callback)
+    }
+
+    /**
      * Updates the value for a specific valueId and notifies all its subscribers.
      */
     updateValue(valueId: string, newValue: T): void {
