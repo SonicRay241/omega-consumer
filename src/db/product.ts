@@ -1,7 +1,7 @@
 import { redis } from "../lib/redis"
 
-export function setProductPrice(id: string, variant: string, newPrice: number) {
-    redis.set(`PRODUCT_PRICE::${id}::${variant}`, newPrice.toString())
+export function setProductPrice(id: string, variant: string, newPrice: number, TTL: number = 600) {
+    redis.set(`PRODUCT_PRICE::${id}::${variant}`, newPrice.toString(), { EX: TTL })
     console.log(`Updated product ${id} with variant ${variant} to ${newPrice}`)
     // Update db
 }
