@@ -1,41 +1,50 @@
 import { Elysia, t } from "elysia";
 import { SubscriptionManager } from "./lib/subscribe";
-import { getProductPrice, setProductPrice } from "./db/product";
+import { getCompetitorPrice, getDefaultVariant, getProductPrice, getVariantFromId, setProductPrice } from "./db/product";
 import cron from "@elysiajs/cron";
-import { AMQPClient } from "@cloudamqp/amqp-client";
+import { CounterManager } from "./lib/counter";
+import { setupConsumer } from "./lib/amqp";
 
-const amqp = new AMQPClient(process.env.RABBIT_SERVICE_URI!)
-const amqpConn = await amqp.connect()
-const channel = await amqpConn.channel()
-channel.basicQos(100)
+const startHour = new Date()
+const webUrl = process.env.WEB_URL!
+const aiUrl = process.env.AI_URL!
+const secretKey = process.env.SECRET_KEY!
+
+startHour.setHours(startHour.getHours() - (startHour.getMinutes() > 0 ? 0 : 1))
+startHour.setMinutes(0, 0, 0)
 
 const manager = new SubscriptionManager<number>()
+const counter = new CounterManager()
+
+setupConsumer(
+  (idVar, amount) => {
+    counter.add(idVar, amount)
+  },
+  startHour
+)
+
 const app = new Elysia()
-
-const defaultVariant = "250ml" // fetch from db later
-
-function updatePrices() {
-  // Consume and aggregate
-}
 
 app.ws("/live-update/product/:productId/price", {
   async open(ws) {
     const { productId } = ws.data.params
 
-    const currValue = manager.getValue(productId + defaultVariant)
+    const defaultVariant = await getDefaultVariant(productId, webUrl)
+
+    const currValue = manager.getValue(productId + ":" + defaultVariant)
 
     if (!currValue) {
-      const productPrice = await getProductPrice(productId, defaultVariant)
+      const productPrice = await getProductPrice(productId, defaultVariant, webUrl)
 
-      manager.updateValue(productId + defaultVariant, productPrice)
+      manager.updateValue(productId + ":" + defaultVariant, productPrice)
     }
 
-    manager.subscribe(productId + defaultVariant, ws.id, (newValue) => {
+    manager.subscribe(productId + ":" + defaultVariant, ws.id, (newValue) => {
       ws.send(newValue)
     })
 
     // Get updated value
-    ws.send(manager.getValue(productId + defaultVariant))
+    ws.send(manager.getValue(productId + ":" + defaultVariant))
   },
 
   async message(ws, message) {
@@ -44,7 +53,7 @@ app.ws("/live-update/product/:productId/price", {
     const currValue = manager.getValue(productId + message)
 
     if (!currValue) {
-      const productPrice = await getProductPrice(productId, message)
+      const productPrice = await getProductPrice(productId, message, webUrl)
 
       manager.updateValue(productId + message, productPrice)
     }
@@ -76,46 +85,70 @@ app.post("/product/:productId/price",
   }
 )
 
-app.get("/consume-test", async () => {
-  const a: (string | null)[] = []
+async function updatePrice() {
+  console.log(`Updating Prices... [${(new Date()).toLocaleString()}]`)
+  const counterObj = counter.getAll()
+  console.log(counterObj);
 
-  await channel.basicConsume(
-    "stock-demand",
-    {
-      exclusive: false,
-      noAck: false,
-      args: {
-        consumeOffset: "first"
+  for (const key in counterObj) {
+    const [id, variantId] = key.split(":")
+
+    const variantName = await getVariantFromId(variantId, webUrl)
+    console.log(variantName);
+
+    const competitorPrice = await getCompetitorPrice(id, webUrl)
+    const demandRate = counterObj[key]
+    const basePrice = await getProductPrice(id, variantName, webUrl)
+
+    const req = await fetch("http://127.0.0.1:5000/predict", {
+      method: "POST",
+      body: JSON.stringify({
+        demandRate: demandRate,
+        competitorPrice: competitorPrice,
+        basePrice: basePrice,
+        secretKey: secretKey
+      }),
+      headers: {
+        'Content-Type': 'application/json'
       }
-    },
-    (message) => {
-      try {
-        if (message) {
-          const messageBody = message.bodyToString();
-          console.log("Received message:", messageBody);
-          a.push(messageBody); // Push parsed object to the array
-  
-          channel.basicAck(message.deliveryTag, false); // Acknowledge message
-        } else {
-          console.error("Received a null or undefined message");
-        }
-      } catch (error) {
-        console.error("Error processing message:", error);
+    })
+
+    console.log(req.status);
+
+
+    const res = await req.json() as { finalPrice: number }
+    console.log(res);
+
+
+    manager.updateValue(id + ":" + variantName, res.finalPrice)
+  }
+  counter.clear()
+}
+
+app.post("/dev/update-price",
+  ({ body }) => {
+    if (body.key == secretKey) {
+      updatePrice()
+      return {
+        message: "success"
       }
     }
-  )
-
-  return {
-    queue: a,
+    return {
+      message: "..."
+    }
+  },
+  {
+    body: t.Object({
+      key: t.String()
+    })
   }
-})
+)
 
 app.use(cron({
   name: "price-update",
   pattern: "0 * * * *",
-  run() {
-    console.log(`Updating Prices... [${(new Date()).toLocaleString()}]`)
-    updatePrices()
+  async run() {
+    await updatePrice()
   }
 }))
 
@@ -124,8 +157,3 @@ app.listen(3000);
 console.log(
   `🦊 Elysia is running at ${app.server?.hostname}:${app.server?.port}`
 );
-
-app.onStop(() => {
-  amqpConn.close()
-  console.log("AMQP Connection Closed.")
-})
